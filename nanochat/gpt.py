@@ -19,19 +19,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nanochat.common import get_dist_info, print0
-from nanochat.muon import Muon, DistMuon
-from nanochat.adamw import DistAdamW
+from common import get_dist_info, print0
+from muon import Muon, DistMuon
+from adamw import DistAdamW
 
 
 @dataclass
 class GPTConfig:
-    sequence_len: int = 1024
+    sequence_len: int = 10
     vocab_size: int = 50304
     n_layer: int = 12
-    n_head: int = 6  # number of query heads
-    n_kv_head: int = 6  # number of key/value heads (MQA)
-    n_embd: int = 768
+    n_head: int = 16  # number of query heads
+    n_embd: int = 7168
+
+    q_compression = 576
+    kv_compression = 576
+    rotate_dim = 576
 
 
 def norm(x):
@@ -43,7 +46,7 @@ def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4  # multihead attention
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:]  # split up last time into two halves
-    y1 = x1 * cos + x2 * sin  # rotate pairs of dims
+    y1 = x1 * cos + x2 * sin  # rotate_dim pairs of dims
     y2 = x1 * (-sin) + x2 * cos
     out = torch.cat([y1, y2], 3)  # re-assemble
     out = out.to(x.dtype)  # ensure input/output dtypes match
@@ -134,95 +137,106 @@ class CausalSelfAttention(nn.Module):
 
 
 class LatentSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config):  # , cos_sin, layer_idx):
         super().__init__()
-        self.layer_idx = layer_idx
-        self.n_head = config.n_head
-        self.q_latent_dim = config.n_q_latent_dim
-        self.kv_latent_dim = config.n_kv_latent_dim
+
+        # self.layer_idx = layer_idx
+
         self.n_embd = config.n_embd
+        self.n_head = config.n_head
         self.head_dim = self.n_embd // self.n_head
-        assert self.n_embd % self.n_head == 0
-        # assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
+        assert self.n_embd % self.n_head == 0, (
+            "embedding dimension must be divisible by number of heads"
+        )
+
+        self.q_compression = config.q_compression
+        self.kv_compression = config.kv_compression
+        assert self.q_compression < self.n_embd and self.kv_compression < self.n_embd, (
+            "compression ratio must be less than embedding dimension"
+        )
+
+        self.rotate_dim = config.rotate_dim
 
         # query projection
-        self.cq_d = nn.Linear(self.n_embd, self.q_latent_dim)
+        self.Wq_d = nn.Linear(self.n_embd, self.q_compression)
         # precomputed matrix multiplication of weight_q and weigth_k for multiple heads
-        self.c_qk = nn.Linear(
-            self.q_latent_dim, self.n_head * self.kv_latent_dim, bias=False
+        self.W_qk = nn.Linear(
+            self.q_compression, self.n_head * self.kv_compression, bias=False
         )
 
-        self.ckv_d = nn.Linear(self.n_embd, self.kv_latent_dim, bias=False)
-        self.cv_u = nn.Linear(
-            self.kv_latent_dim, self.n_head * self.head_dim, bias=False
+        # key-value projection
+        self.Wkv_d = nn.Linear(self.n_embd, self.kv_compression, bias=False)
+
+        # query rotation projection
+        self.W_qr = nn.Linear(
+            self.q_compression, self.n_head * self.rotate_dim, bias=False
+        )
+        # key rotation projection
+        self.W_kr = nn.Linear(self.n_embd, self.rotate_dim, bias=False)
+
+        # output transformation (precomputed multiplication of weight_v and weight_out)
+        self.W_proj = nn.Linear(
+            self.n_head * self.kv_compression, self.n_embd, bias=False
         )
 
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-
-    def forward(self, x, cos_sin, kv_cache):
+    def forward(self, x, cos_sin=None, kv_cache=None):
+        # batch_size, seq_len, embedding_dim
         B, T, C = x.size()
 
-        # Project the input to get queries, keys, and values
-        ct_q = self.W_dq(x)
-        ct_kv = self.W_dkv(x)
+        assert C == self.n_embd, (
+            f"Input embedding dimension {C} does not match expected dimension {self.n_embd}"
+        )
 
-        # TO DO: space embbeding
+        # Query attention projection and rotation projection
+        cq_t = self.Wq_d(x)  # [B, T, q_compression]
+        qc_t = self.W_qk(cq_t).view(
+            B, self.n_head, T, self.kv_compression
+        )  # [B, n_head, T, kv_compression]
+        print(f"qc_t: {qc_t.shape}")
+        # Key attention projection and rotation projection
+        ckv_t = self.Wkv_d(x)  # [B, T, kv_compression]
+        print(f"ckv_t: {ckv_t.shape}")
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
-        # cos, sin = cos_sin
-        q, k = (
-            apply_rotary_emb(q, cos, sin),
-            apply_rotary_emb(k, cos, sin),
-        )  # QK rotary embedding
-        q, k = norm(q), norm(k)  # QK norm
-        qk = self.c_qk(q).view(B, T, self.n_head, self.kv_latent_dim)
-        qk, kvt = qk.transpose(1, 2), kv.transpose(-2, -1)[:, None, ...]
-
-        # TO DO: cache
-        # Apply KV cache: insert current k,v into cache, get the full view so far
-        # if kv_cache is not None:
-        #     k, v = kv_cache.insert_kv(self.layer_idx, k, v)
-        # Tq = q.size(2) # number of queries in this forward pass
-        # Tk = k.size(2) # number of keys/values in total (in the cache + current forward pass)
-        kv_cache = None
-        # Attention: queries attend to keys/values autoregressively. A few cases to handle:
-        enable_gqa = (
-            # self.n_head != self.n_kv_head
-        )  # Group Query Attention (GQA): duplicate key/value heads to match query heads if desired
-        if kv_cache is None or Tq == Tk:
-            # During training (no KV cache), attend as usual with causal attention
-            # And even if there is KV cache, we can still use this simple version when Tq == Tk
-            y = torch.softmax(
-                torch.matmul(qk, kvt) / math.sqrt(self.kv_latent_dim),
-                dim=-1,
-            )
-        elif Tq == 1:
-            # During inference but with a single query in this forward pass:
-            # The query has to attend to all the keys/values in the cache
-            y = F.scaled_dot_product_attention(
-                q, k, v, is_causal=False, enable_gqa=enable_gqa
-            )
-
+        if cos_sin is not None:
+            cos, sin = cos_sin
+            kr_t, qr_t = (
+                apply_rotary_emb(self.W_kr(x), cos, sin),  # [B, T, rotate_dim]
+                apply_rotary_emb(self.W_qr(cq_t), cos, sin).view(
+                    B, self.n_head, T, self.rotate_dim
+                ),  # [B, n_head, T, rotate_dim]
+            )  # QK rotary embedding
         else:
-            # During inference AND we have a chunk of queries in this forward pass:
-            # First, each query attends to all the cached keys/values (i.e. full prefix)
-            attn_mask = torch.zeros(
-                (Tq, Tk), dtype=torch.bool, device=q.device
-            )  # True = keep, False = mask
-            prefix_len = Tk - Tq
-            if prefix_len > 0:  # can't be negative but could be zero
-                attn_mask[:, :prefix_len] = True
-            # Then, causal attention within this chunk
-            attn_mask[:, prefix_len:] = torch.tril(
-                torch.ones((Tq, Tq), dtype=torch.bool, device=q.device)
-            )
-            y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa
-            )
+            kr_t, qr_t = (
+                self.W_kr(x),
+                self.W_qr(cq_t).view(B, self.n_head, T, self.rotate_dim),
+            )  # no embedding (just checking shapes)
+        print(f"kr_t: {kr_t.shape}")
+        print(f"qr_t: {qr_t.shape}")
+        # q, k = norm(q), norm(k)  # QK norm
 
-        V = self.cv_u(kv).view(B, T, self.n_head, -1)
+        q_t = torch.cat(
+            [qc_t, qr_t], dim=-1
+        )  # [B, n_head, T, kv_compression + rotate_dim]
+        print(f"q_t: {q_t.shape}")
+        k_t = torch.cat([ckv_t, kr_t], dim=-1)  # [B, T, kv_compression + rotate_dim]
+        print(f"k_t: {k_t.shape}")
+        # TO DO: cache
+
+        if kv_cache is None:
+            k_t, ckv_t = (
+                k_t.unsqueeze(1),
+                ckv_t.unsqueeze(1),
+            )
+            attention = F.scaled_dot_product_attention(
+                q_t, k_t, ckv_t, is_causal=False
+            )  # [B, num_heads, T, kv_compression]
+
         # Re-assemble the heads side by side and project back to residual stream
-        output = torch.matmul(y, V.transpose(1, 2)).transpose(1, 2).contiguous()
-        output = self.c_proj(output.view(B, T, -1))
+        attention = (
+            attention.transpose(1, 2).contiguous().view(B, T, -1)
+        )  # [B, num_heads, T, kv_compression] ->  [B, T, num_heads, kv_compression] -> [B, T, num_heads * kv_compression]
+        print(f"attention.shape: {attention.shape}")
+        output = self.W_proj(attention)
 
         return output
 
