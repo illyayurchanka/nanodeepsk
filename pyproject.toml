@@ -16,6 +16,7 @@ dependencies = [
     "torch>=2.8.0",
     "uvicorn>=0.36.0",
     "wandb>=0.21.3",
+    "torchinfo",
 ]
 
 [build-system]
@@ -43,35 +44,39 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 
-# target torch to cuda 12.8 or CPU
+# target torch to cuda 13.0 or CPU
 [tool.uv.sources]
-torch = [  
-    { index = "pytorch-cpu", extra = "cpu" },  
-    { index = "pytorch-cu128", extra = "gpu" },  
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu130", extra = "gpu" },
 ]
-
-[[tool.uv.index]]  
-name = "pytorch-cpu"  
-url = "https://download.pytorch.org/whl/cpu"  
-explicit = true  
-  
-[[tool.uv.index]]  
-name = "pytorch-cu128"  
-url = "https://download.pytorch.org/whl/cu128"  
+pytorch-triton = [
+    { index = "pytorch-cu130", extra = "gpu" },
+]
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
-[project.optional-dependencies]  
-cpu = [  
-    "torch>=2.8.0",  
-]  
-gpu = [  
-    "torch>=2.8.0",  
-]  
-  
-[tool.uv]  
-conflicts = [  
-    [  
-        { extra = "cpu" },  
-        { extra = "gpu" },  
-    ],  
-]  
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/nightly/cu130"
+explicit = true
+
+[project.optional-dependencies]
+cpu = [
+    "torch>=2.8.0",
+]
+gpu = [
+    "torch>=2.10.0.dev",
+    "pytorch-triton>=3.5.0",
+]
+
+[tool.uv]
+prerelease = "allow"
+conflicts = [
+    [
+        { extra = "cpu" },
+        { extra = "gpu" },
+    ],
+]
