@@ -89,11 +89,11 @@ class LatentSelfAttention(nn.Module):
         )
         # key up projection
         self.Wk_u = nn.Linear(
-            self.kv_compression, self.n_head * self.head_dim, bias=False
+            self.kv_compression, self.head_dim * self.n_head, bias=False
         )
         # value up projection
         self.Wv_u = nn.Linear(
-            self.kv_compression, self.n_head * self.head_dim, bias=False
+            self.kv_compression, self.head_dim * self.n_head, bias=False
         )
 
         # rotation projection
@@ -110,16 +110,23 @@ class LatentSelfAttention(nn.Module):
         # precomputed (for eval mode)
         # precomputed matrix multiplication of weight_q and weigth_k for multiple heads
         self.W_qk = None  # nn.Linear(
+        # self.W_qk = nn.Linear(
         #     self.q_compression, self.n_head * self.kv_compression, bias=False
         # )
+        # )
         # output transformation (precomputed multiplication of weight_v and weight_out)
-        self.W_out_prime = None  # nn.Linear(
-        #     self.n_head * self.kv_compression, self.n_embd, bias=False
+        # self.W_out_prime = nn.Linear(
+        #     self.kv_compression * self.n_head, self.n_embd, bias=False
         # )
 
         self.scaler = float(
             1.0 / math.sqrt(self.kv_compression + self.rotate_dim)
         )  # Store as float in initialization
+        self.device = (
+            torch.device("cuda", 0)
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
 
     def forward(self, x, cos_sin=None, kv_cache=None):
         # batch_size, seq_len, embedding_dim
@@ -133,14 +140,14 @@ class LatentSelfAttention(nn.Module):
         cq_t = self.Wq_d(x)  # [B, T, q_compression]
         # KeyValue compressed
         ckv_t = self.Wkv_d(x)  # [B, T, kv_compression]
-
+        train = False
         # Query uncompressed
-        if self.training:
+        if train:
             Q_t = self.Wq_u(cq_t).view(
                 B, self.n_head, T, self.head_dim
             )  # [B, n_head, T, head_dim]
-            V = self.Wv_u(ckv_t).view(B, self.n_head, T, self.head_dim)
-            K_t = self.Wk_u(ckv_t).view(B, self.n_head, T, self.head_dim)
+            V = self.Wv_u(ckv_t).view(B, T, self.head_dim)  # [B, T, head_dim]
+            K_t = self.Wk_u(ckv_t).view(B, T, self.head_dim)  # [B, T, head_dim] #
         else:
             if self.W_qk is None:
                 self._absorb()
@@ -170,21 +177,21 @@ class LatentSelfAttention(nn.Module):
         if kv_cache is not None:
             K_t, K_r = kv_cache.insert_kv(self.layer_idx, K_t, K_r)
 
-        Q = torch.cat([Q_t, Q_r], dim=-1)  # [B, n_head, T, kv_compression + rotate_dim]
+        Q = torch.cat([Q_t, Q_r], dim=-1)  # [B, n_head, T, head_dim + rotate_dim]
 
-        K = torch.cat([K_t, K_r], dim=-1)  # [B, T, kv_compression + rotate_dim]
+        K = torch.cat([K_t, K_r], dim=-1)  # [B, T, head_dim + rotate_dim]
 
         Tq = Q.size(2)
         Tk = K.size(2)
 
         K, V = (
-            K.unsqueeze(1),
-            V.unsqueeze(1),
+            K.unsqueeze(1),  # [B, 1, T, head_dim + rotate_dim]
+            V.unsqueeze(1),  # [B, 1, T, head_dim]
         )
         if kv_cache is None:
             attention = F.scaled_dot_product_attention(
                 Q, K, V, is_causal=True, scale=self.scaler
-            )  # [B, num_heads, T, kv_compression]
+            )  # [B, num_heads, T, head_dim]
         elif Tq == 1:
             # During inference but with a single query in this forward pass:
             # The query has to attend to all the keys/values in the cache
@@ -210,9 +217,9 @@ class LatentSelfAttention(nn.Module):
         # Re-assemble the heads side by side and project back to residual stream
         attention = (
             attention.transpose(1, 2).contiguous().view(B, T, -1)
-        )  # [B, num_heads, T, kv_compression] ->  [B, T, num_heads, kv_compression] -> [B, T, num_heads * kv_compression]
+        )  # [B, num_heads, T, kv_compression] ->  [B, T, num_heads, head_dim] -> [B, T, num_heads * head_dim]
         print(f"attention.shape: {attention.shape}")
-        if self.training:
+        if train:
             output = self.W_out(attention)
         else:
             output = self.W_out_prime(attention)
@@ -222,8 +229,8 @@ class LatentSelfAttention(nn.Module):
     def _absorb(self):
         """
         Create absorbed weights for inference:
-        W_q' = W_q @ W_uk^T  -> (d_model, d_c)
-        W_o' = W_uv @ W_o    -> (d_c, d_model)
+        W_q' = W_q @ W_uk^T
+        W_o' = W_uv @ W_o
         Returns two Linear layers that replace (W_q, W_uk) and (W_uv, W_o).
         """
         # Extract raw weight matrices (note .weight is (out_features, in_features))
@@ -233,31 +240,21 @@ class LatentSelfAttention(nn.Module):
         W_out = self.W_out.weight.data  # (d_model, d_all)
 
         # Compute fused weights with shapes matching Linear(in=d_model, out=d_c) and (in=d_c, out=d_model)
-        W_qk = (Wq_u.t() @ Wk_u).contiguous()  # (d_model, d_c)
-        print(W_qk.shape)
-        # Explanation:
-        # W_q: (d_all, d_model), W_uk: (d_all, d_c)
-        # We want W_q' as (d_model, d_c) for a Linear(d_model -> d_c):
-        # (x @ W_q^T) @ W_uk  == x @ (W_q^T @ W_uk) ; W_q^T: (d_model, d_all), @ W_uk: (d_all, d_c)
-        # So W_q'^T = W_q^T @ W_uk  -> W_q' = (W_q @ W_uk)^T
+        print(Wq_u.shape)
+        print(Wk_u.shape)
+        W_qk = (Wq_u.t() @ Wk_u).t().contiguous()  # (q_compressd, kv_compressed)
 
-        W_o_prime = (Wv_u.t() @ W_out).t().contiguous()  # (d_c, d_model)
-        # Explanation:
-        # v = c @ W_uv^T  (since Linear(d_c->d_all) uses W_uv^T)
-        # y = (attn @ v) @ W_o^T
-        # After reordering: attn @ c @ (W_uv^T @ W_o^T) = attn @ c @ (W_o @ W_uv)^T
-        # We want a Linear(d_c -> d_model): weight should be (d_model, d_c) transposed in module
-        # Here we directly produce (d_c, d_model) as stored in Linear.weight
-
+        W_out_prime = (Wv_u.t() @ W_out).t().contiguous()  # (kv_compressed, n_embed)
+        print(W_out_prime.shape2)
         # Build small Linear layers holding fused weights
         self.W_qk = nn.Linear(
-            self.q_compression, self.kv_compression * self.n_head, bias=False
+            self.q_compression, self.kv_compression, device=self.device, bias=False
         )
         self.W_out_prime = nn.Linear(
             self.kv_compression * self.n_head, self.n_embd, bias=False
         )
-        self.W_qk.weight.data.copy_(W_qk)  # Linear stores (out, in)
-        self.W_out_prime.weight.data.copy_(W_o_prime)
+        self.W_qk.weight.data.copy_(W_qk)
+        self.W_out_prime.weight.data.copy_(W_out_prime)
 
 
 class MLP(nn.Module):
